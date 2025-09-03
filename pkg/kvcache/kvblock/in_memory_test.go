@@ -23,18 +23,27 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-func TestInMemoryAddBasic(t *testing.T) {
+func TestHashicorpLRUInMemoryAddBasic(t *testing.T) {
 	// Create index
 	index, err := kvblock.NewInMemoryIndex(nil)
 	assert.NoError(t, err)
 	testAddBasic(t, index)
 }
 
-func TestInMemoryIndexSize(t *testing.T) {
+func TestRistrettoInMemoryAddBasic(t *testing.T) {
+	// Create index
+	cfg := kvblock.DefaultRistrettoMemoryIndex()
+	index, err := kvblock.NewInMemoryIndex(cfg)
+	assert.NoError(t, err)
+	testAddBasic(t, index)
+}
+
+func TestHashicorpLRUInMemoryIndexSize(t *testing.T) {
 	// Test with small size to verify eviction
 	cfg := &kvblock.InMemoryIndexConfig{
 		Size:         2, // Only 2 keys max
 		PodCacheSize: 1, // Pod cache size doesn't matter for this test
+		Backend:      kvblock.BackendHashicorpLRU,
 	}
 
 	index, err := kvblock.NewInMemoryIndex(cfg)
@@ -68,11 +77,12 @@ func TestInMemoryIndexSize(t *testing.T) {
 	assert.Contains(t, podsPerKey[key3], "pod3")
 }
 
-func TestInMemoryIndexPodCacheSize(t *testing.T) {
+func TestHashicorpLRUInMemoryIndexPodCacheSize(t *testing.T) {
 	// Test with small limits to verify enforcement
 	cfg := &kvblock.InMemoryIndexConfig{
 		Size:         1, // Only 1 key max
 		PodCacheSize: 2, // Only 2 pods per key
+		Backend:      kvblock.BackendHashicorpLRU,
 	}
 
 	index, err := kvblock.NewInMemoryIndex(cfg)

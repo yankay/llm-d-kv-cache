@@ -45,3 +45,6 @@ func testAddBasic(t *testing.T, index kvblock.Index) {
 	assert.Contains(t, podsPerKey, key)
 	assert.Equal(t, podsPerKey[key], []string{"10.0.0.1", "10.0.0.2"})
 }
+
+// 加用例，一个是entries有重复的添加
+// 一个key存在的追加。并检测去重

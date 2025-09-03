@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/dgraph-io/ristretto/v2"
 	lru "github.com/hashicorp/golang-lru/v2"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/klog/v2"
@@ -29,8 +30,19 @@ import (
 )
 
 const (
-	defaultInMemoryIndexSize = 1e8 // TODO: change to memory-size based configuration
-	defaultPodsPerKey        = 10  // number of pods per key
+	defaultInMemoryIndexSize  = 1e8                // TODO: change to memory-size based configuration
+	defaultPodsPerKey         = 10                 // number of pods per key
+	defaultCacheCapacityBytes = 1024 * 1024 * 1024 // 1GB default cache capacity
+)
+
+// Backend represents the cache implementation type.
+type Backend string
+
+const (
+	// BackendHashicorpLRU represents the hashicorp/golang-lru cache implementation.
+	BackendHashicorpLRU Backend = "hashicorpLRU"
+	// BackendRistretto represents the dgraph-io/ristretto cache implementation.
+	BackendRistretto Backend = "ristretto"
 )
 
 // InMemoryIndexConfig holds the configuration for the InMemoryIndex.
@@ -39,42 +51,181 @@ type InMemoryIndexConfig struct {
 	Size int `json:"size"`
 	// PodCacheSize is the maximum number of pod entries per key.
 	PodCacheSize int `json:"podCacheSize"`
+	// CapacityBytes is the maximum memory capacity in bytes for the cache.
+	CapacityBytes int64 `json:"capacityBytes"`
+	// Backend specifies the cache implementation type.
+	Backend Backend `json:"backend"`
 }
 
 // DefaultInMemoryIndexConfig returns a default configuration for the InMemoryIndex.
 func DefaultInMemoryIndexConfig() *InMemoryIndexConfig {
+	return DefaultHashicorpLRUIndexConfig()
+}
+
+// DefaultHashicorpLRUIndexConfig returns a default configuration for the HashicorpLRUIndex.
+func DefaultHashicorpLRUIndexConfig() *InMemoryIndexConfig {
 	return &InMemoryIndexConfig{
 		Size:         defaultInMemoryIndexSize,
 		PodCacheSize: defaultPodsPerKey,
+		Backend:      BackendHashicorpLRU,
 	}
 }
 
-// NewInMemoryIndex creates a new InMemoryIndex instance.
-func NewInMemoryIndex(cfg *InMemoryIndexConfig) (*InMemoryIndex, error) {
+// DefaultHashicorpLRUIndexConfig returns a default configuration for the HashicorpLRUIndex.
+func DefaultRistrettoMemoryIndex() *InMemoryIndexConfig {
+	return &InMemoryIndexConfig{
+		Size:          defaultInMemoryIndexSize,
+		PodCacheSize:  defaultPodsPerKey,
+		CapacityBytes: defaultCacheCapacityBytes,
+		Backend:       BackendRistretto,
+	}
+}
+
+// NewInMemoryIndex creates a new InMemoryIndex instance based on the backend type.
+func NewInMemoryIndex(cfg *InMemoryIndexConfig) (Index, error) {
 	if cfg == nil {
 		cfg = DefaultInMemoryIndexConfig()
 	}
 
-	cache, err := lru.New[Key, *PodCache](cfg.Size)
+	switch cfg.Backend {
+	case BackendHashicorpLRU:
+		if cfg.CapacityBytes != 0 {
+			return nil, fmt.Errorf("BackendHashicorpLRU does not support CapacityBytes parameter")
+		}
+		return NewHashicorpLRUMemoryIndex(cfg.Size, cfg.PodCacheSize)
+	case BackendRistretto:
+		return NewRistrettoMemoryIndex(cfg.Size, cfg.PodCacheSize, cfg.CapacityBytes)
+	default:
+		return nil, fmt.Errorf("unsupported backend: %s", cfg.Backend)
+	}
+}
+
+type RistrettoMemoryIndex struct {
+	// data holds the mapping of keys to sets of pod identifiers.
+	data *ristretto.Cache[string, *[]PodEntry]
+	// podCacheSize is the maximum number of pod entries per key.
+	podCacheSize int
+}
+
+func NewRistrettoMemoryIndex(size int, podCacheSize int, capacityBytes int64) (*RistrettoMemoryIndex, error) {
+	cache, err := ristretto.NewCache(&ristretto.Config[string, *[]PodEntry]{
+		NumCounters: int64(size),
+		MaxCost:     capacityBytes,
+		BufferItems: 64,
+	})
 	if err != nil {
-		return nil, fmt.Errorf("failed to initialize in-memory index: %w", err)
+		return nil, fmt.Errorf("failed to initialize Ristretto LRU cache: %w", err)
 	}
 
-	return &InMemoryIndex{
+	return &RistrettoMemoryIndex{
 		data:         cache,
-		podCacheSize: cfg.PodCacheSize,
+		podCacheSize: podCacheSize,
 	}, nil
 }
 
-// InMemoryIndex is an in-memory implementation of the Index interface.
-type InMemoryIndex struct {
+// Add implements Index.
+func (r *RistrettoMemoryIndex) Add(ctx context.Context, keys []Key, entries []PodEntry) error {
+	if len(keys) == 0 || len(entries) == 0 {
+		return fmt.Errorf("no keys or entries provided for adding to index")
+	}
+
+	traceLogger := klog.FromContext(ctx).V(logging.TRACE).WithName("kvblock.RistrettoMemoryIndex.Add")
+
+	for _, key := range keys {
+		keyStr := key.String()
+		podCache, found := r.data.Get(keyStr) // bumps LRU timestamp if found
+		if !found {
+			pe := []PodEntry{}
+			podCache = &pe
+		}
+
+		r.data.Set(keyStr, podCache, 1)
+
+		for _, entry := range entries {
+			podCache.cache.Add(entry, struct{}{}) // TODO: can this be batched to avoid multiple locks?
+		}
+		// r.data.SetCost(keyStr, podCache.cache.Len())
+		traceLogger.Info("added pods to key", "key", key, "pods", entries)
+	}
+
+	return nil
+}
+
+// Evict implements Index.
+func (r *RistrettoMemoryIndex) Evict(ctx context.Context, key Key, entries []PodEntry) error {
+	panic("unimplemented")
+}
+
+// Lookup implements Index.
+func (r *RistrettoMemoryIndex) Lookup(ctx context.Context, keys []Key, podIdentifierSet sets.Set[string]) (map[Key][]string, error) {
+	if len(keys) == 0 {
+		return nil, fmt.Errorf("no keys provided for lookup")
+	}
+
+	traceLogger := klog.FromContext(ctx).V(logging.TRACE).WithName("kvblock.RistrettoMemoryIndex.Lookup")
+
+	podsPerKey := make(map[Key][]string)
+	highestHitIdx := 0
+
+	for idx, key := range keys {
+		keyStr := key.String()
+		if pods, found := r.data.Get(keyStr); found { //nolint:nestif // TODO: can this be optimized?
+			if pods == nil || pods.cache.Len() == 0 {
+				traceLogger.Info("no pods found for key, cutting search", "key", key)
+				return podsPerKey, nil // early stop since prefix-chain breaks here
+			}
+
+			highestHitIdx = idx
+
+			if podIdentifierSet.Len() == 0 {
+				// If no pod identifiers are provided, return all pods
+				podsPerKey[key] = append(podsPerKey[key],
+					utils.SliceMap(pods.cache.Keys(), func(pod PodEntry) string {
+						return pod.PodIdentifier
+					})...)
+			} else {
+				// Filter pods based on the provided pod identifiers
+				for _, pod := range pods.cache.Keys() {
+					if podIdentifierSet.Has(pod.PodIdentifier) {
+						podsPerKey[key] = append(podsPerKey[key], pod.PodIdentifier)
+					}
+				}
+			}
+		} else {
+			traceLogger.Info("key not found in index", "key", key)
+		}
+	}
+
+	traceLogger.Info("lookup completed", "highest-hit-index", highestHitIdx,
+		"pods-per-key", podsPerKeyPrintHelper(podsPerKey))
+
+	return podsPerKey, nil
+}
+
+var _ Index = &RistrettoMemoryIndex{}
+
+// HashicorpLRUMemoryIndex is an in-memory implementation of the Index interface.
+type HashicorpLRUMemoryIndex struct {
 	// data holds the mapping of keys to sets of pod identifiers.
 	data *lru.Cache[Key, *PodCache]
 	// podCacheSize is the maximum number of pod entries per key.
 	podCacheSize int
 }
 
-var _ Index = &InMemoryIndex{}
+var _ Index = &HashicorpLRUMemoryIndex{}
+
+// NewHashicorpLRUMemoryIndex creates a new HashicorpLRUMemoryIndex instance.
+func NewHashicorpLRUMemoryIndex(size, podCacheSize int) (*HashicorpLRUMemoryIndex, error) {
+	cache, err := lru.New[Key, *PodCache](size)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize hashicorp LRU cache: %w", err)
+	}
+
+	return &HashicorpLRUMemoryIndex{
+		data:         cache,
+		podCacheSize: podCacheSize,
+	}, nil
+}
 
 // PodCache represents a cache for pod entries.
 type PodCache struct {
@@ -91,14 +242,14 @@ type PodCache struct {
 // It returns:
 // 1. A map where the keys are those in (1) and the values are pod-identifiers.
 // 2. An error if any occurred during the operation.
-func (m *InMemoryIndex) Lookup(ctx context.Context, keys []Key,
+func (m *HashicorpLRUMemoryIndex) Lookup(ctx context.Context, keys []Key,
 	podIdentifierSet sets.Set[string],
 ) (map[Key][]string, error) {
 	if len(keys) == 0 {
 		return nil, fmt.Errorf("no keys provided for lookup")
 	}
 
-	traceLogger := klog.FromContext(ctx).V(logging.TRACE).WithName("kvblock.InMemoryIndex.Lookup")
+	traceLogger := klog.FromContext(ctx).V(logging.TRACE).WithName("kvblock.HashicorpLRUMemoryIndex.Lookup")
 
 	podsPerKey := make(map[Key][]string)
 	highestHitIdx := 0
@@ -138,12 +289,12 @@ func (m *InMemoryIndex) Lookup(ctx context.Context, keys []Key,
 }
 
 // Add adds a set of keys and their associated pod entries to the index backend.
-func (m *InMemoryIndex) Add(ctx context.Context, keys []Key, entries []PodEntry) error {
+func (m *HashicorpLRUMemoryIndex) Add(ctx context.Context, keys []Key, entries []PodEntry) error {
 	if len(keys) == 0 || len(entries) == 0 {
 		return fmt.Errorf("no keys or entries provided for adding to index")
 	}
 
-	traceLogger := klog.FromContext(ctx).V(logging.TRACE).WithName("kvblock.InMemoryIndex.Add")
+	traceLogger := klog.FromContext(ctx).V(logging.TRACE).WithName("kvblock.HashicorpLRUMemoryIndex.Add")
 
 	for _, key := range keys {
 		podCache, found := m.data.Get(key) // bumps LRU timestamp if found
@@ -171,12 +322,12 @@ func (m *InMemoryIndex) Add(ctx context.Context, keys []Key, entries []PodEntry)
 }
 
 // Evict removes a key and its associated pod entries from the index backend.
-func (m *InMemoryIndex) Evict(ctx context.Context, key Key, entries []PodEntry) error {
+func (m *HashicorpLRUMemoryIndex) Evict(ctx context.Context, key Key, entries []PodEntry) error {
 	if len(entries) == 0 {
 		return fmt.Errorf("no entries provided for eviction from index")
 	}
 
-	traceLogger := klog.FromContext(ctx).V(logging.TRACE).WithName("kvblock.InMemoryIndex.Evict")
+	traceLogger := klog.FromContext(ctx).V(logging.TRACE).WithName("kvblock.HashicorpLRUMemoryIndex.Evict")
 
 	podCache, found := m.data.Get(key)
 	if !found || podCache == nil {
