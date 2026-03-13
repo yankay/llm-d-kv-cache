@@ -1,0 +1,12 @@
+---
+description: Sign all git commits with -s flag
+alwaysApply: true
+---
+
+# Git Commit Signing
+
+When creating git commits, **always** use the `-s` flag to add a `Signed-off-by` line (DCO sign-off).
+
+```bash
+git commit -s -m "commit message"
+```

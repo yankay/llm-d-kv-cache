@@ -1,0 +1,28 @@
+---
+description: Use proxy for any outbound/international network access on this machine (China)
+alwaysApply: true
+---
+
+# Network Proxy Required (Machine in China)
+
+This machine is located in mainland China. Any access to international resources must go through a proxy.
+
+## Default proxy setup
+
+- Preferred: `source /root/proxy.sh`
+- Proxy variables (from `/root/proxy.sh`):
+  - `ALL_PROXY=socks5://10.64.26.1:10808`
+  - `HTTP_PROXY=http://10.64.26.1:10809`
+  - `HTTPS_PROXY=$HTTP_PROXY`
+  - Lowercase variants are also set.
+  - `NO_PROXY=localhost,127.0.0.1,10.6.0.0/16`
+
+## When to apply
+
+Before running commands that touch the public internet, enable proxy first, including (not limited to):
+- `curl`, `wget`
+- `git clone/fetch`
+- package managers: `apt`, `pip`, `uv`, `npm`, `yarn`, `pnpm`, `go`, `cargo`
+- container tooling: `docker`, `containerd`, `nerdctl`, image pulls
+
+If a command supports explicit proxy flags/config, prefer environment variables for consistency.

@@ -1,0 +1,43 @@
+---
+description: PR review workflow and comment style for llm-d/llm-d-kv-cache
+alwaysApply: true
+---
+
+# PR Review Workflow
+
+I am a **reviewer** for the [llm-d/llm-d-kv-cache](https://github.com/llm-d/llm-d-kv-cache) project.
+
+## CI & Review Flow (GitHub Actions + Prow-style Commands)
+
+PR CI checks run automatically on `pull_request`:
+- **ci-pr-checks**: lint (pre-commit, clang-format), `make build`, `make test`
+- **ci-signed-commits**: verify all commits are signed (DCO)
+- **ci-examples**: run `hack/verify-examples.sh` (target: main)
+- **ci-uds-tokenizer**: UDS tokenizer tests (when relevant paths change)
+- **auto-assign**: assigns reviewers from OWNERS file
+
+Prow-style commands (via PR comments, handled by GitHub Actions):
+- `/lgtm` — add lgtm label (removed automatically on new commits)
+- `/approve` — approve for merge
+- `/hold` — prevent auto-merge
+- `/rerun` — re-run CI checks
+- Both `/lgtm` and `/approve` are needed; `prow-pr-automerge` merges every 5 min
+
+## Triage — When to Skip
+
+- **CI failures**: PRs with failing checks do not need review — skip them.
+- **Awaiting reply**: If I have recently commented and no reply yet, **skip**. Inform me it's pending.
+
+## Linking PRs and Issues
+
+Always include the **full URL** — not just `#1234`.
+
+- Good: `[#1234](https://github.com/llm-d/llm-d-kv-cache/pull/1234)`
+- Bad: `#1234`
+
+## Comment Style
+
+- **Thank the contributor by name**: e.g. `Thanks @username!`
+- **Acknowledge effort**: e.g. "Great work on this!", "Nice improvement!"
+- **Thank reviewers/participants too**: Give shout-outs to those who left useful feedback.
+- **Be constructive**: Even when requesting changes, pair feedback with appreciation.
